@@ -73,6 +73,19 @@ from vllm.v1.worker.startup_plan import (
     maybe_save_startup_plan,
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+
+try:
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        restore_quantized_lm_heads,
+        share_source_lm_heads,
+    )
+except ImportError:
+    # vLLM builds before the draft_lm_head_quantization feature (e.g. v0.31.0)
+    # do not ship online/lm_head.py; draft weight updates then have no
+    # quantized heads to swap.
+    restore_quantized_lm_heads = None
+    share_source_lm_heads = None
+
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
@@ -212,6 +225,7 @@ class NPUWorker(WorkerBase):
         # is available, since the engine needs a reference to the model.
         self.weight_transfer_engine = None
         self._weight_update_active = False
+        self._weight_update_is_draft = False
 
         # FixMe: this is a patch to fix the issue cause by https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170
         from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED
@@ -383,47 +397,155 @@ class NPUWorker(WorkerBase):
                 "(enabled: true) which disables NZ automatically."
             )
 
+    def get_draft_model(self) -> nn.Module | None:
+        return self.model_runner.get_draft_model()
+
+    def supports_draft_weight_updates(self) -> bool:
+        engine = self.weight_transfer_engine
+        speculative_config = self.speculative_config
+        get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+        return (
+            engine is not None
+            and engine.supports_draft_weight_update
+            and callable(get_draft_model)
+            and get_draft_model() is not None
+            and speculative_config is not None
+            and speculative_config.draft_model_config is not None
+        )
+
+    def _set_draft_weight_update_target(self) -> None:
+        assert self.weight_transfer_engine is not None
+
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError(
+                "Draft model weight update requested, but no draft model is configured."
+            )
+
+        speculative_config = self.speculative_config
+        if speculative_config is None or speculative_config.draft_model_config is None:
+            raise RuntimeError(
+                "Draft model weight update requested, but no draft model "
+                "config is configured."
+            )
+
+        self.weight_transfer_engine.set_weight_update_target(
+            draft_model, speculative_config.draft_model_config
+        )
+
     def start_weight_update(self) -> None:
         """Begin a new weight update; prepares the model for layerwise reload."""
+        with set_current_vllm_config(self.vllm_config):
+            self._start_weight_update()
+
+    def start_draft_weight_update(self) -> None:
+        """Like start_weight_update, but retargets the engine at the speculative
+        draft model for this session.
+        """
+        with set_current_vllm_config(self.vllm_config):
+            self._start_weight_update(is_draft=True)
+
+    def _start_weight_update(self, is_draft: bool = False) -> None:
         self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+
+        if is_draft and not self.weight_transfer_engine.supports_draft_weight_update:
+            raise RuntimeError(
+                f"{type(self.weight_transfer_engine).__name__} does not support "
+                "draft model weight updates."
+            )
 
         if self._weight_update_active:
             raise RuntimeError(
-                "start_weight_update called while a weight update is already active. Call finish_weight_update first."
+                "start_weight_update called while a weight update is already "
+                "active. Call finish_weight_update first."
             )
 
         self._check_nz_disabled()
 
-        assert self.weight_transfer_engine is not None
-        self.weight_transfer_engine.start_weight_update()
+        draft_model = self.get_draft_model() if is_draft else None
+        try:
+            if is_draft:
+                self._set_draft_weight_update_target()
+            if draft_model is not None and share_source_lm_heads is not None:
+                # Load through the unquantized target head, as without
+                # draft_lm_head_quantization; finish re-derives the copies.
+                share_source_lm_heads(draft_model)
+            self.weight_transfer_engine.start_weight_update()
+        except BaseException:
+            self.weight_transfer_engine.reset_weight_update_target()
+            if draft_model is not None and restore_quantized_lm_heads is not None:
+                restore_quantized_lm_heads(draft_model, refresh=False)
+            raise
         self._weight_update_active = True
+        self._weight_update_is_draft = is_draft
 
-    def update_weights(self, update_info: dict) -> None:
-        """Receive a chunk of weights from the trainer and load them in place."""
+    def update_weights(self, update_info: dict | list[dict]) -> None:
+        """Receive one weight update chunk from the trainer.
+
+        start_weight_update must be called before update_weights and
+        finish_weight_update must be called after all chunks have been sent.
+        Every chunk loads into whichever model the session's start_weight_update
+        / start_draft_weight_update call selected.
+
+        Args:
+            update_info: Backend-specific update info, or a list indexed by
+                global worker rank across data parallel replicas.
+
+        """
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
-        # state machine driven by start/finish.
         if not self._weight_update_active:
-            raise RuntimeError("start_weight_update must be called before update_weights.")
+            raise RuntimeError(
+                "start_weight_update must be called before update_weights."
+            )
 
-        try:
-            self.weight_transfer_engine.update_weights(update_info)
-        except BaseException:
-            self._weight_update_active = False
-            raise
+        with set_current_vllm_config(self.vllm_config):
+            try:
+                if isinstance(update_info, list):
+                    parallel_config = self.vllm_config.parallel_config
+                    local_update_info = update_info[
+                        parallel_config.data_parallel_index
+                        * parallel_config.world_size
+                        + self.rank
+                    ]
+                else:
+                    local_update_info = update_info
+                self.weight_transfer_engine.update_weights(local_update_info)
+            except BaseException:
+                self._weight_update_active = False
+                self.weight_transfer_engine.reset_weight_update_target()
+                if self._weight_update_is_draft and (
+                    (draft_model := self.get_draft_model()) is not None
+                    and restore_quantized_lm_heads is not None
+                ):
+                    restore_quantized_lm_heads(draft_model, refresh=False)
+                raise
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update; runs layerwise postprocessing."""
         self._check_weight_transfer_engine()
 
         if not self._weight_update_active:
-            raise RuntimeError("start_weight_update must be called before finish_weight_update.")
+            raise RuntimeError(
+                "start_weight_update must be called before finish_weight_update."
+            )
 
         assert self.weight_transfer_engine is not None
-        self.weight_transfer_engine.finish_weight_update()
-        self.model_runner.reset_lora_state()
-        self._weight_update_active = False
+        with set_current_vllm_config(self.vllm_config):
+            self.weight_transfer_engine.finish_weight_update()
+            self.weight_transfer_engine.reset_weight_update_target()
+            self._weight_update_active = False
+            if self._weight_update_is_draft and (
+                (draft_model := self.get_draft_model()) is not None
+                and restore_quantized_lm_heads is not None
+            ):
+                restore_quantized_lm_heads(draft_model)
+
+        # Weight transfer bypasses NPUModelRunner.reload_weights().
+        if not self._weight_update_is_draft:
+            self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
