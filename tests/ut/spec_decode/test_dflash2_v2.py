@@ -310,8 +310,12 @@ def test_eager_speculator_keeps_target_compilation_and_graph_config():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
 
 
-def test_init_cudagraph_manager_requires_enforce_eager(monkeypatch):
-    calls: list[CUDAGraphMode] = []
+@pytest.mark.parametrize(
+    "enforce_eager,expected_mode",
+    [(False, CUDAGraphMode.FULL_DECODE_ONLY), (None, CUDAGraphMode.FULL_DECODE_ONLY), (True, CUDAGraphMode.NONE)],
+)
+def test_init_cudagraph_manager_preserves_graph_mode(monkeypatch, enforce_eager, expected_mode):
+    calls = []
     speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     speculator.speculative_config = SimpleNamespace(enforce_eager=enforce_eager)
     speculator.update_stream = object()
